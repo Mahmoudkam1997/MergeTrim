@@ -1,0 +1,20 @@
+Make it executable:
+
+bash
+chmod +x MergTrim
+Install it system-wide:
+
+bash
+sudo mv MergTrim /usr/local/bin/
+sudo sed -i 's/\r$//' /usr/local/bin/MergTrim
+Command to excute:
+##Replace data with the actual data folder name
+MergTrim run-pipeline --input ./data --output ./results
+
+OR 
+
+# First merging
+Merge_Trim merge --input ./data --output ./results
+
+# Then trimming  
+Merge_Trim trim --input ./data --output ./results

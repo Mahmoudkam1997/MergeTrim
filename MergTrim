@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Install command: curl -sL https://your-url/Merge_Trim | sudo tee /usr/local/bin/Merge_Trim && sudo chmod +x /usr/local/bin/Merge_Trim
+
+# GENOTECH - Bioinformatics Tool
+# Version: 1.0.0
+
+set -o pipefail
+
+VERSION="1.0.0"
+
+# GENOTECH Logo/ASCII Art
+show_logo() {
+    echo "   ____  _____  _   _  ___  _______  _____  _   _   ____ "
+    echo "  / ___|| ____|| \ | ||_ _||__   __||_   _|| | | | / ___|"
+    echo " | |  _ |  _|  |  \| | | |    | |     | |  | |_| || |    "
+    echo " | |_| || |___ | |\  | | |    | |     | |  |  _  || |___ "
+    echo "  \____||_____||_| \_||___|   |_|     |_|  |_| |_| \____|"
+    echo "  Bioinformatics Pipeline Tool v$VERSION"
+    echo "  ========================================="
+    echo ""
+}
+# Default locations
+DEFAULT_INPUT="."
+DEFAULT_OUTPUT="."
+DEFAULT_MERGE_DIR="vsearch_output"
+DEFAULT_TRIM_DIR="trimmed_output"
+TRIMMOMATIC_JAR_DEFAULT="./trimmomatic-0.39.jar"
+
+# Logging helpers
+info()  { printf "\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*" >&2; }
+error() { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*" >&2; }
+
+usage() {
+  show_logo
+  cat <<EOF
+Usage: $0 <command> [--input DIR] [--output DIR] [--help] [--version]
+
+Commands:
+  merge         Merge paired reads (_R1_ and _R2_) using vsearch
+  trim          Trim merged reads using Trimmomatic
+  run-pipeline  Run merge then trim sequentially
+
+Options:
+  --input DIR   Input directory (default: $DEFAULT_INPUT)
+  --output DIR  Output base directory (default: $DEFAULT_OUTPUT)
+  --help        Show this help and exit
+  --version     Show version and exit
+
+Environment:
+  TRIMMOMATIC_JAR  Path to Trimmomatic JAR (default: $TRIMMOMATIC_JAR_DEFAULT)
+
+Examples:
+  $0 merge --input samples --output results
+  $0 run-pipeline --input samples --output results
+EOF
+}
+
+# Parse global options placed after the command
+parse_opts() {
+  INPUT_DIR="$DEFAULT_INPUT"
+  OUTPUT_DIR="$DEFAULT_OUTPUT"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --input)
+        shift
+        INPUT_DIR="$1"
+        ;;
+      --input=*)
+        INPUT_DIR="${1#*=}"
+        ;;
+      --output)
+        shift
+        OUTPUT_DIR="$1"
+        ;;
+      --output=*)
+        OUTPUT_DIR="${1#*=}"
+        ;;
+      --help)
+        usage
+        exit 0
+        ;;
+      --version)
+        show_logo
+        exit 0
+        ;;
+      *)
+        error "Unknown option: $1"
+        usage
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  # Normalize paths
+  INPUT_DIR="${INPUT_DIR:-.}"
+  OUTPUT_DIR="${OUTPUT_DIR:-.}"
+
+  if [[ ! -d "$INPUT_DIR" ]]; then
+    error "Input directory does not exist: $INPUT_DIR"
+    exit 2
+  fi
+}
+
+check_command() {
+  command -v "$1" >/dev/null 2>&1 || { error "Required command not found: $1"; return 1; }
+  return 0
+}
+
+merge_cmd() {
+  local input_dir="$1"
+  local out_dir="$2"
+  local failures=0
+
+  check_command vsearch || return 3
+
+  mkdir -p "$out_dir" || { error "Cannot create output directory: $out_dir"; return 2; }
+
+  # Find R1 files
+  shopt -s nullglob
+  local files=( "$input_dir"/*_R1*.fastq )
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    warn "No R1 fastq files found in $input_dir (pattern '*_R1*.fastq')"
+    return 0
+  fi
+
+  for r1 in "${files[@]}"; do
+    r2="${r1/_R1/_R2}"
+    sample=$(basename "$r1" | cut -d "_" -f1)
+    out="$out_dir/${sample}_merged.fastq"
+
+    if [[ ! -f "$r2" ]]; then
+      warn "Skipping: paired file not found for $r1 -> expected $r2"
+      ((failures++))
+      continue
+    fi
+
+    info "Merging $(basename "$r1") and $(basename "$r2") -> $(basename "$out")"
+    if ! vsearch --fastq_mergepairs "$r1" --reverse "$r2" --fastqout "$out"; then
+      error "vsearch failed for sample $sample"
+      ((failures++))
+      continue
+    fi
+  done
+
+  if [[ $failures -gt 0 ]]; then
+    error "Merge completed with $failures failure(s)"
+    return 4
+  fi
+
+  info "All merges completed successfully."
+  return 0
+}
+
+trim_cmd() {
+  local input_dir="$1"
+  local out_dir="$2"
+  local trimmomatic_jar="${TRIMMOMATIC_JAR:-$TRIMMOMATIC_JAR_DEFAULT}"
+  local failures=0
+
+  check_command java || return 3
+  if [[ ! -f "$trimmomatic_jar" ]]; then
+    error "Trimmomatic JAR not found: $trimmomatic_jar"
+    return 3
+  fi
+
+  mkdir -p "$out_dir" || { error "Cannot create output directory: $out_dir"; return 2; }
+
+  shopt -s nullglob
+  local files=( "$input_dir"/*_merged.fastq )
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    warn "No merged fastq files found in $input_dir (pattern '*_merged.fastq')"
+    return 0
+  fi
+
+  for f in "${files[@]}"; do
+    base=$(basename "$f" .fastq)
+    out="$out_dir/${base}_trimmed.fastq"
+
+    info "Trimming $(basename "$f") -> $(basename "$out")"
+    if ! java -jar "$trimmomatic_jar" SE -phred33 "$f" "$out" LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:100; then
+      error "Trimmomatic failed for $f"
+      ((failures++))
+      continue
+    fi
+  done
+
+  if [[ $failures -gt 0 ]]; then
+    error "Trimming completed with $failures failure(s)"
+    return 4
+  fi
+
+  info "All trimming completed successfully."
+  return 0
+}
+
+# Main dispatcher
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --version)
+    show_logo
+    exit 0
+    ;;
+  merge)
+    parse_opts "$@"
+    MERGE_OUT_DIR="${OUTPUT_DIR%/}/$DEFAULT_MERGE_DIR"
+    merge_cmd "$INPUT_DIR" "$MERGE_OUT_DIR"
+    exit $?
+    ;;
+  trim)
+    parse_opts "$@"
+    TRIM_OUT_DIR="${OUTPUT_DIR%/}/$DEFAULT_TRIM_DIR"
+    # For trimming, input_dir should contain *_merged.fastq files
+    trim_cmd "$INPUT_DIR" "$TRIM_OUT_DIR"
+    exit $?
+    ;;
+  run-pipeline)
+    parse_opts "$@"
+    MERGE_OUT_DIR="${OUTPUT_DIR%/}/$DEFAULT_MERGE_DIR"
+    TRIM_OUT_DIR="${OUTPUT_DIR%/}/$DEFAULT_TRIM_DIR"
+
+    show_logo
+    info "Starting pipeline: merge -> trim"
+    if ! merge_cmd "$INPUT_DIR" "$MERGE_OUT_DIR"; then
+      error "Merge step failed. Aborting pipeline."
+      exit 5
+    fi
+
+    if ! trim_cmd "$MERGE_OUT_DIR" "$TRIM_OUT_DIR"; then
+      error "Trim step failed. Pipeline aborted."
+      exit 6
+    fi
+
+    info "✅ Pipeline completed successfully. Merged: $MERGE_OUT_DIR  Trimmed: $TRIM_OUT_DIR"
+    exit 0
+    ;;
+  *)
+    error "Unknown command: $COMMAND"
+    usage
+    exit 2
+    ;;
+esac
